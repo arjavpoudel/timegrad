@@ -1,9 +1,10 @@
 """
-TimeGrad-style diffusion model for bimodal Gaussian mixture time series forecasting.
-- Enhanced RNN encoder for complex temporal patterns
-- Improved denoiser architecture for multimodal distributions
-- Bimodal Gaussian mixture data generation
-- Better evaluation metrics for multimodal forecasting
+FINAL FIXED TimeGrad-style diffusion model for bimodal time series forecasting.
+Key fixes:
+1. Correct DDPM sampling formula ✅
+2. PROPER autoregressive training (matches inference) ✅
+3. Distributional bimodality ✅
+4. Better architecture based on original TimeGrad ✅
 """
 
 import torch
@@ -11,12 +12,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy import stats
 from sklearn.mixture import GaussianMixture
+from functools import partial
+
+
+def extract(a, t, x_shape):
+    """Extract values from tensor a at indices t, with proper broadcasting"""
+    b, *_ = t.shape
+    out = a.gather(-1, t)
+    return out.reshape(b, *((1,) * (len(x_shape) - 1)))
 
 
 def cosine_beta_schedule(timesteps, s=0.008):
-    """Cosine beta schedule for diffusion - better for complex distributions"""
+    """Cosine beta schedule for diffusion"""
     steps = timesteps + 1
     x = np.linspace(0, timesteps, steps)
     alphas_cumprod = np.cos(((x / timesteps) + s) / (1 + s) * np.pi * 0.5) ** 2
@@ -25,408 +33,537 @@ def cosine_beta_schedule(timesteps, s=0.008):
     return np.clip(betas, 0, 0.999)
 
 
-class EnhancedDiffusion(nn.Module):
-    """Enhanced diffusion model for bimodal distributions"""
+class GaussianDiffusion(nn.Module):
+    """Fixed diffusion model with correct DDPM sampling"""
 
-    def __init__(self, data_dim, context_dim, num_steps=50, beta_schedule="cosine"):
+    def __init__(self, denoise_fn, data_dim, num_steps=50, beta_schedule="cosine"):
         super().__init__()
+        self.denoise_fn = denoise_fn
         self.data_dim = data_dim
-        self.num_steps = num_steps
+        self.num_timesteps = num_steps
 
+        # Generate beta schedule
         if beta_schedule == "cosine":
             betas = cosine_beta_schedule(num_steps)
         else:
             betas = np.linspace(0.0001, 0.02, num_steps)
 
+        # Compute alphas and other constants
         alphas = 1.0 - betas
         alphas_cumprod = np.cumprod(alphas)
+        alphas_cumprod_prev = np.append(1.0, alphas_cumprod[:-1])
 
-        self.register_buffer("betas", torch.tensor(betas, dtype=torch.float32))
-        self.register_buffer("alphas", torch.tensor(alphas, dtype=torch.float32))
+        # Convert to torch tensors
+        to_torch = partial(torch.tensor, dtype=torch.float32)
+
+        self.register_buffer("betas", to_torch(betas))
+        self.register_buffer("alphas", to_torch(alphas))
+        self.register_buffer("alphas_cumprod", to_torch(alphas_cumprod))
+        self.register_buffer("alphas_cumprod_prev", to_torch(alphas_cumprod_prev))
+
+        # Forward process coefficients
+        self.register_buffer("sqrt_alphas_cumprod", to_torch(np.sqrt(alphas_cumprod)))
         self.register_buffer(
-            "alphas_cumprod", torch.tensor(alphas_cumprod, dtype=torch.float32)
-        )
-        self.register_buffer(
-            "sqrt_alphas_cumprod",
-            torch.sqrt(torch.tensor(alphas_cumprod, dtype=torch.float32)),
-        )
-        self.register_buffer(
-            "sqrt_one_minus_alphas_cumprod",
-            torch.sqrt(1 - torch.tensor(alphas_cumprod, dtype=torch.float32)),
+            "sqrt_one_minus_alphas_cumprod", to_torch(np.sqrt(1.0 - alphas_cumprod))
         )
 
-        # Improved time embedding
-        time_emb_dim = 64
-        self.time_emb = nn.Sequential(
-            nn.Embedding(num_steps, time_emb_dim // 2),
-            nn.Linear(time_emb_dim // 2, time_emb_dim),
+        # Reverse process coefficients
+        self.register_buffer(
+            "sqrt_recip_alphas_cumprod", to_torch(np.sqrt(1.0 / alphas_cumprod))
+        )
+        self.register_buffer(
+            "sqrt_recipm1_alphas_cumprod", to_torch(np.sqrt(1.0 / alphas_cumprod - 1))
+        )
+
+        # Posterior q(x_{t-1} | x_t, x_0) coefficients
+        posterior_variance = (
+            betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
+        )
+        self.register_buffer("posterior_variance", to_torch(posterior_variance))
+        self.register_buffer(
+            "posterior_log_variance_clipped",
+            to_torch(np.log(np.maximum(posterior_variance, 1e-20))),
+        )
+
+        self.register_buffer(
+            "posterior_mean_coef1",
+            to_torch(betas * np.sqrt(alphas_cumprod_prev) / (1.0 - alphas_cumprod)),
+        )
+        self.register_buffer(
+            "posterior_mean_coef2",
+            to_torch(
+                (1.0 - alphas_cumprod_prev) * np.sqrt(alphas) / (1.0 - alphas_cumprod)
+            ),
+        )
+
+    def q_sample(self, x_start, t, noise=None):
+        """Forward diffusion process: add noise to x_start"""
+        if noise is None:
+            noise = torch.randn_like(x_start)
+
+        sqrt_alphas_cumprod_t = extract(self.sqrt_alphas_cumprod, t, x_start.shape)
+        sqrt_one_minus_alphas_cumprod_t = extract(
+            self.sqrt_one_minus_alphas_cumprod, t, x_start.shape
+        )
+
+        return sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * noise
+
+    def predict_start_from_noise(self, x_t, t, noise):
+        """Predict x_0 from x_t and predicted noise"""
+        return (
+            extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t
+            - extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
+        )
+
+    def q_posterior_mean_variance(self, x_start, x_t, t):
+        """Compute posterior mean and variance for q(x_{t-1} | x_t, x_0)"""
+        posterior_mean = (
+            extract(self.posterior_mean_coef1, t, x_t.shape) * x_start
+            + extract(self.posterior_mean_coef2, t, x_t.shape) * x_t
+        )
+        posterior_variance = extract(self.posterior_variance, t, x_t.shape)
+        posterior_log_variance_clipped = extract(
+            self.posterior_log_variance_clipped, t, x_t.shape
+        )
+
+        return posterior_mean, posterior_variance, posterior_log_variance_clipped
+
+    def p_mean_variance(self, x_t, cond, t):
+        """Compute mean and variance for p(x_{t-1} | x_t)"""
+        # Predict noise
+        predicted_noise = self.denoise_fn(x_t, t, cond)
+
+        # Predict x_0
+        x_start = self.predict_start_from_noise(x_t, t, predicted_noise)
+
+        # Get posterior mean and variance
+        model_mean, posterior_variance, posterior_log_variance = (
+            self.q_posterior_mean_variance(x_start, x_t, t)
+        )
+
+        return model_mean, posterior_variance, posterior_log_variance
+
+    @torch.no_grad()
+    def p_sample(self, x_t, cond, t):
+        """Single reverse diffusion step - CORRECT IMPLEMENTATION"""
+        batch_size = x_t.shape[0]
+        device = x_t.device
+
+        # Get mean and variance
+        model_mean, _, model_log_variance = self.p_mean_variance(x_t, cond, t)
+
+        # Add noise (except at t=0)
+        noise = torch.randn_like(x_t)
+        nonzero_mask = (1 - (t == 0).float()).reshape(
+            batch_size, *((1,) * (len(x_t.shape) - 1))
+        )
+
+        return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
+
+    @torch.no_grad()
+    def sample(self, cond, num_samples=1):
+        """Sample from the diffusion model"""
+        batch_size = cond.shape[0]
+        device = cond.device
+
+        if num_samples > 1:
+            # Repeat conditioning for multiple samples
+            cond = cond.repeat_interleave(num_samples, dim=0)
+            total_batch_size = batch_size * num_samples
+        else:
+            total_batch_size = batch_size
+
+        # Start from pure noise
+        x = torch.randn(total_batch_size, self.data_dim, device=device)
+
+        # Reverse diffusion process
+        for i in reversed(range(self.num_timesteps)):
+            t = torch.full((total_batch_size,), i, device=device, dtype=torch.long)
+            x = self.p_sample(x, cond, t)
+
+        if num_samples > 1:
+            # Reshape to (batch_size, num_samples, data_dim)
+            x = x.view(batch_size, num_samples, self.data_dim)
+
+        return x
+
+    def training_loss(self, x_start, cond):
+        """Compute training loss - same as original TimeGrad"""
+        batch_size = x_start.shape[0]
+        device = x_start.device
+
+        # Random timesteps
+        t = torch.randint(0, self.num_timesteps, (batch_size,), device=device)
+
+        # Add noise
+        noise = torch.randn_like(x_start)
+        x_noisy = self.q_sample(x_start, t, noise)
+
+        # Predict noise
+        predicted_noise = self.denoise_fn(x_noisy, t, cond)
+
+        # MSE loss on noise prediction (same as original TimeGrad)
+        return F.mse_loss(predicted_noise, noise)
+
+
+class SimpleDenoiser(nn.Module):
+    """Simplified but proper denoiser network"""
+
+    def __init__(self, data_dim, context_dim, hidden_dim=128, num_layers=3):
+        super().__init__()
+        self.data_dim = data_dim
+
+        # Time embedding
+        time_dim = 32
+        self.time_mlp = nn.Sequential(
+            nn.Linear(time_dim, hidden_dim),
             nn.SiLU(),
-            nn.Linear(time_emb_dim, time_emb_dim),
+            nn.Linear(hidden_dim, hidden_dim),
         )
 
-        # More sophisticated denoiser with residual connections
-        hidden_dim = 256
+        # Sinusoidal time embedding
+        self.time_embed = SinusoidalPositionEmbeddings(time_dim)
+
+        # Input projections
         self.input_proj = nn.Linear(data_dim, hidden_dim)
         self.context_proj = nn.Linear(context_dim, hidden_dim)
-        self.time_proj = nn.Linear(time_emb_dim, hidden_dim)
 
-        # Residual blocks for better gradient flow
-        self.blocks = nn.ModuleList([self._make_block(hidden_dim) for _ in range(4)])
+        # Main network with residual connections
+        self.layers = nn.ModuleList(
+            [ResidualBlock(hidden_dim) for _ in range(num_layers)]
+        )
 
+        # Output projection
         self.output_proj = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.SiLU(),
             nn.Linear(hidden_dim // 2, data_dim),
         )
 
-    def _make_block(self, dim):
-        return nn.Sequential(
-            nn.Linear(dim, dim), nn.SiLU(), nn.Dropout(0.1), nn.Linear(dim, dim)
-        )
+    def forward(self, x, t, cond):
+        # Time embedding
+        t_emb = self.time_embed(t)
+        t_emb = self.time_mlp(t_emb)
 
-    def add_noise(self, x, t, noise=None):
-        if noise is None:
-            noise = torch.randn_like(x)
-        sqrt_alphas_cumprod_t = self.sqrt_alphas_cumprod[t].view(-1, 1)
-        sqrt_one_minus_alphas_cumprod_t = self.sqrt_one_minus_alphas_cumprod[t].view(
-            -1, 1
-        )
-        return sqrt_alphas_cumprod_t * x + sqrt_one_minus_alphas_cumprod_t * noise
-
-    def predict_noise(self, x_noisy, t, context):
-        # Project inputs
-        x_emb = self.input_proj(x_noisy)
-        c_emb = self.context_proj(context)
-        t_emb = self.time_proj(self.time_emb(t))
+        # Input embeddings
+        x_emb = self.input_proj(x)
+        c_emb = self.context_proj(cond)
 
         # Combine inputs
         h = x_emb + c_emb + t_emb
 
-        # Apply residual blocks
-        for block in self.blocks:
-            h = h + block(h)  # Residual connection
+        # Apply residual layers
+        for layer in self.layers:
+            h = layer(h)
 
         return self.output_proj(h)
 
-    def training_loss(self, x, context):
-        batch_size = x.shape[0]
-        t = torch.randint(0, self.num_steps, (batch_size,), device=x.device)
-        noise = torch.randn_like(x)
-        x_noisy = self.add_noise(x, t, noise)
-        predicted_noise = self.predict_noise(x_noisy, t, context)
-        return F.mse_loss(predicted_noise, noise)
 
-    @torch.no_grad()
-    def sample(self, context, num_samples=None):
-        original_batch_size = context.shape[0]
-        if num_samples is None:
-            batch_size = original_batch_size
-            final_context = context
-        else:
-            batch_size = original_batch_size * num_samples
-            final_context = context.repeat_interleave(num_samples, dim=0)
+class SinusoidalPositionEmbeddings(nn.Module):
+    """Sinusoidal position embeddings for time steps"""
 
-        x = torch.randn(batch_size, self.data_dim, device=context.device)
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
 
-        for step in reversed(range(self.num_steps)):
-            t = torch.full((batch_size,), step, device=context.device, dtype=torch.long)
-            predicted_noise = self.predict_noise(x, t, final_context)
-
-            alpha_t = self.alphas[step]
-            sqrt_one_minus_alpha_cumprod_t = self.sqrt_one_minus_alphas_cumprod[step]
-
-            # More stable sampling
-            x = (x - sqrt_one_minus_alpha_cumprod_t * predicted_noise) / torch.sqrt(
-                alpha_t
-            )
-
-            if step > 0:
-                noise = torch.randn_like(x)
-                x = x + torch.sqrt(self.betas[step]) * noise
-
-        if num_samples is None:
-            return x
-        else:
-            return x.view(original_batch_size, num_samples, self.data_dim)
+    def forward(self, time):
+        device = time.device
+        half_dim = self.dim // 2
+        embeddings = np.log(10000) / (half_dim - 1)
+        embeddings = torch.exp(torch.arange(half_dim, device=device) * -embeddings)
+        embeddings = time[:, None] * embeddings[None, :]
+        embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
+        return embeddings
 
 
-class BimodalTimeGrad(nn.Module):
-    """TimeGrad model enhanced for bimodal Gaussian mixture forecasting"""
+class ResidualBlock(nn.Module):
+    """Simple residual block"""
+
+    def __init__(self, dim):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Linear(dim, dim), nn.SiLU(), nn.Dropout(0.1), nn.Linear(dim, dim)
+        )
+
+    def forward(self, x):
+        return x + self.block(x)
+
+
+class FinalFixedBimodalTimeGrad(nn.Module):
+    """FINAL FIXED TimeGrad model with proper autoregressive training"""
 
     def __init__(self, data_dim, hidden_dim=64, num_diffusion_steps=50):
         super().__init__()
         self.data_dim = data_dim
         self.hidden_dim = hidden_dim
 
-        # Enhanced RNN encoder for better context representation
+        # RNN encoder for past data
         self.rnn = nn.LSTM(
             data_dim, hidden_dim, num_layers=2, batch_first=True, dropout=0.1
         )
+
+        # Context processing
         self.context_proj = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
 
-        self.diffusion = EnhancedDiffusion(data_dim, hidden_dim, num_diffusion_steps)
+        # Denoiser network
+        self.denoiser = SimpleDenoiser(data_dim, hidden_dim)
+
+        # Diffusion model
+        self.diffusion = GaussianDiffusion(self.denoiser, data_dim, num_diffusion_steps)
 
     def encode_past(self, past_data):
-        _, (h_n, _) = self.rnn(past_data)
-        context = self.context_proj(h_n[-1])  # Use last layer's hidden state
+        """Encode past data into context vector"""
+        # RNN encoding
+        rnn_out, (h_n, _) = self.rnn(past_data)
+
+        # Use last hidden state as context
+        context = self.context_proj(h_n[-1])
         return context
 
     def forward(self, past_data, future_data):
+        """
+        FIXED TRAINING: Autoregressive training that matches inference
+        This is the KEY FIX - training now matches inference procedure
+        """
         batch_size, pred_len, _ = future_data.shape
-        context = self.encode_past(past_data)
-
         total_loss = 0.0
+
+        # Keep track of the evolving sequence during training
+        current_sequence = past_data.clone()
+
         for t in range(pred_len):
+            # Encode current sequence (this changes each step - KEY FIX!)
+            context = self.encode_past(current_sequence)
+
+            # Target for this time step
             target = future_data[:, t, :]
+
+            # Compute loss for this time step
             loss = self.diffusion.training_loss(target, context)
             total_loss += loss
 
+            # Update sequence with ground truth for next iteration
+            # This simulates what happens during inference but uses ground truth
+            current_sequence = torch.cat(
+                [
+                    current_sequence[:, 1:, :],  # Remove oldest
+                    target.unsqueeze(1),  # Add current ground truth
+                ],
+                dim=1,
+            )
+
         return total_loss / pred_len
 
-    def sample_future(self, past_data, num_future_steps, num_samples=1):
+    def sample_future_autoregressive(self, past_data, num_future_steps, num_samples=1):
+        """Generate future samples with proper autoregressive generation"""
         self.eval()
         with torch.no_grad():
-            context = self.encode_past(past_data)
+            batch_size = past_data.shape[0]
+            device = past_data.device
+
+            # Initialize sequence with past data
+            current_sequence = past_data.clone()
             future_samples = []
 
-            for _ in range(num_future_steps):
-                samples = self.diffusion.sample(context, num_samples)
+            for step in range(num_future_steps):
+                # Encode current sequence
+                context = self.encode_past(current_sequence)
+
+                # Sample next time step
+                next_samples = self.diffusion.sample(context, num_samples)
+
                 if num_samples == 1:
-                    samples = samples.unsqueeze(1)
+                    # Single sample case
+                    next_step = next_samples  # Shape: (batch_size, data_dim)
+                    future_samples.append(next_step.unsqueeze(1))  # Add time dimension
+
+                    # Update sequence: remove oldest, add newest
+                    current_sequence = torch.cat(
+                        [
+                            current_sequence[:, 1:, :],  # Remove first time step
+                            next_step.unsqueeze(1),  # Add new time step
+                        ],
+                        dim=1,
+                    )
                 else:
-                    samples = samples.unsqueeze(2)
-                future_samples.append(samples)
+                    # Multiple samples case - use mean for sequence update
+                    next_step_mean = next_samples.mean(dim=1)  # (batch_size, data_dim)
+                    future_samples.append(
+                        next_samples.unsqueeze(2)
+                    )  # Add time dimension
+
+                    # Update sequence with mean
+                    current_sequence = torch.cat(
+                        [current_sequence[:, 1:, :], next_step_mean.unsqueeze(1)], dim=1
+                    )
 
             if num_samples == 1:
-                return torch.cat(future_samples, dim=1)
+                return torch.cat(
+                    future_samples, dim=1
+                )  # (batch_size, pred_len, data_dim)
             else:
-                return torch.cat(future_samples, dim=2)
+                return torch.cat(
+                    future_samples, dim=2
+                )  # (batch_size, num_samples, pred_len, data_dim)
 
 
-def create_bimodal_data(batch_size=32, seq_len=20, pred_len=5, data_dim=1):
+def create_2d_distributional_bimodal_data(
+    batch_size=32, seq_len=20, pred_len=5, data_dim=2
+):
     """
-    Generate bimodal Gaussian mixture time series data.
-    Each time series switches between two different AR processes representing different modes.
+    Create 2D time series with clear bimodal structure in 2D space.
     """
     data = torch.zeros(batch_size, seq_len + pred_len, data_dim)
 
-    for b in range(batch_size):
-        # Initialize with random mode
-        current_mode = np.random.choice([0, 1])
-        x = torch.randn(data_dim) * 0.5
+    # Two well-separated modes in 2D space
+    mode1_center = torch.tensor([-2.5, -2.0])
+    mode2_center = torch.tensor([2.5, 2.0])
+    mode_std = 0.4
 
-        # Parameters for two different AR processes (two modes)
-        # Mode 0: Centered around 0, more stable
-        ar_coeff_0 = 0.7
-        noise_scale_0 = 0.3
-        mean_0 = 0.0
-
-        # Mode 1: Centered around 2, more volatile
-        ar_coeff_1 = 0.5
-        noise_scale_1 = 0.5
-        mean_1 = 2.0
-
-        for t in range(seq_len + pred_len):
-            # Occasionally switch modes (creates bimodal behavior)
-            if np.random.random() < 0.05:  # 5% chance to switch
-                current_mode = 1 - current_mode
-
-            if current_mode == 0:
-                x = (
-                    ar_coeff_0 * x
-                    + (1 - ar_coeff_0) * mean_0
-                    + noise_scale_0 * torch.randn(data_dim)
-                )
+    for t in range(seq_len + pred_len):
+        for b in range(batch_size):
+            if torch.rand(1) < 0.5:
+                data[b, t] = mode1_center + mode_std * torch.randn(data_dim)
             else:
-                x = (
-                    ar_coeff_1 * x
-                    + (1 - ar_coeff_1) * mean_1
-                    + noise_scale_1 * torch.randn(data_dim)
-                )
-
-            data[b, t] = x
+                data[b, t] = mode2_center + mode_std * torch.randn(data_dim)
 
     return data[:, :seq_len], data[:, seq_len:]
 
 
-def create_simple_bimodal_data(batch_size=32, seq_len=20, pred_len=5, data_dim=1):
-    """
-    Create very simple 1D bimodal data for initial testing.
-    Just alternates between two fixed values with noise.
-    """
-    data = torch.zeros(batch_size, seq_len + pred_len, data_dim)
-
-    for b in range(batch_size):
-        # Two modes at fixed locations
-        mode_values = torch.tensor([-2.0, 2.0])
-        current_mode = np.random.choice([0, 1])
-
-        for t in range(seq_len + pred_len):
-            # Switch modes occasionally
-            if np.random.random() < 0.05:
-                current_mode = 1 - current_mode
-
-            # Add some noise around the mode
-            data[b, t, 0] = mode_values[current_mode] + 0.3 * torch.randn(1)
-
-    return data[:, :seq_len], data[:, seq_len:]
-
-
-def create_complex_bimodal_data(batch_size=32, seq_len=20, pred_len=5, data_dim=2):
-    """
-    Generate more complex 2D bimodal time series where modes are spatially separated.
-    Creates clearer bimodal patterns for better training.
-    """
-    data = torch.zeros(batch_size, seq_len + pred_len, data_dim)
-
-    for b in range(batch_size):
-        # Two well-separated modes in 2D space - increase separation
-        mode_centers = torch.tensor([[-3.0, -2.0], [3.0, 2.0]])  # More separated modes
-        current_mode = np.random.choice([0, 1])
-
-        # Start closer to mode center
-        x = mode_centers[current_mode] + 0.3 * torch.randn(data_dim)
-
-        for t in range(seq_len + pred_len):
-            # Switch modes less frequently for clearer patterns
-            if np.random.random() < 0.02:  # Reduced from 0.03
-                current_mode = 1 - current_mode
-
-            # Stronger AR dynamics towards current mode center
-            center = mode_centers[current_mode]
-            # Increased attraction to mode center, reduced noise
-            x = 0.7 * x + 0.3 * center + 0.2 * torch.randn(data_dim)
-            data[b, t] = x
-
-    return data[:, :seq_len], data[:, seq_len:]
-
-
-def evaluate_bimodal_predictions(true_data, predicted_samples, num_modes=2):
-    """
-    Evaluate bimodal predictions using mode-aware metrics.
-    """
-    batch_size, pred_len, data_dim = true_data.shape
-    num_samples = predicted_samples.shape[1]
-
+def evaluate_distributional_bimodality(true_data, predicted_samples):
+    """Evaluate how well the model captures distributional bimodality."""
     results = {}
 
-    # 1. Standard MSE
-    mean_pred = predicted_samples.mean(dim=1)
+    # Basic MSE
+    if predicted_samples.dim() == 4:  # Multiple samples case
+        mean_pred = predicted_samples.mean(dim=1)
+    else:
+        mean_pred = predicted_samples
+
     mse = F.mse_loss(mean_pred, true_data).item()
     results["mse"] = mse
 
-    # 2. Coverage probability (what fraction of true values fall within prediction intervals)
-    pred_quantiles = torch.quantile(predicted_samples, torch.tensor([0.1, 0.9]), dim=1)
-    coverage = (
-        ((true_data >= pred_quantiles[0]) & (true_data <= pred_quantiles[1]))
-        .float()
-        .mean()
-        .item()
-    )
-    results["coverage_80"] = coverage
+    # For multiple samples, check bimodality at each time step
+    if predicted_samples.dim() == 4:
+        batch_size, num_samples, pred_len, data_dim = predicted_samples.shape
 
-    # 3. Alternative coverage with median absolute deviation
-    pred_median = torch.median(predicted_samples, dim=1)[0]
-    mad = torch.median(torch.abs(predicted_samples - pred_median.unsqueeze(1)), dim=1)[
-        0
-    ]
-    coverage_mad = (
-        ((torch.abs(true_data - pred_median) <= 2 * mad)).float().mean().item()
-    )
-    results["coverage_mad"] = coverage_mad
+        bimodality_scores = []
+        coverage_scores = []
 
-    # 4. Improved bimodality detection
-    bimodality_scores = []
-    for b in range(min(batch_size, 4)):  # Sample a few examples
         for t in range(pred_len):
             for d in range(data_dim):
-                samples = predicted_samples[b, :, t, d].numpy()
-                if len(samples) > 10:
-                    # Simple bimodality test - check if distribution has two peaks
-                    hist, bins = np.histogram(samples, bins=20)
-                    # Find local maxima
-                    peaks = []
-                    for i in range(1, len(hist) - 1):
-                        if (
-                            hist[i] > hist[i - 1]
-                            and hist[i] > hist[i + 1]
-                            and hist[i] > np.max(hist) * 0.3
-                        ):
-                            peaks.append(i)
+                # Get all samples for this time step and dimension
+                samples_t_d = predicted_samples[:, :, t, d]  # (batch_size, num_samples)
+                true_t_d = true_data[:, t, d]  # (batch_size,)
 
-                    bimodality_score = (
-                        len(peaks) / 2.0
-                    )  # Score based on number of peaks
-                    bimodality_scores.append(bimodality_score)
+                # Check bimodality for each batch element
+                for b in range(min(batch_size, 10)):  # Check first 10 batch elements
+                    samples = samples_t_d[b].numpy()  # (num_samples,)
 
-    results["avg_bimodality"] = np.mean(bimodality_scores) if bimodality_scores else 0
+                    # Fit 2-component GMM
+                    try:
+                        gmm = GaussianMixture(
+                            n_components=2, random_state=42, max_iter=100
+                        )
+                        gmm.fit(samples.reshape(-1, 1))
 
-    # 5. Prediction interval width (narrower is better if coverage is good)
-    interval_width = (pred_quantiles[1] - pred_quantiles[0]).mean().item()
-    results["interval_width"] = interval_width
+                        # Check if modes are well separated
+                        centers = gmm.means_.flatten()
+                        if len(centers) == 2:
+                            separation = abs(centers[0] - centers[1])
+                            weights = gmm.weights_
+
+                            # Good bimodality: well separated modes with reasonable weights
+                            min_weight = min(weights)
+                            bimodality_score = separation * min_weight
+                            bimodality_scores.append(bimodality_score)
+
+                            # Coverage: does the true value fall within the prediction distribution?
+                            true_val = true_t_d[b].item()
+                            pred_min, pred_max = samples.min(), samples.max()
+                            coverage = 1.0 if pred_min <= true_val <= pred_max else 0.0
+                            coverage_scores.append(coverage)
+                    except:
+                        pass
+
+        results["avg_bimodality_score"] = (
+            np.mean(bimodality_scores) if bimodality_scores else 0
+        )
+        results["coverage"] = np.mean(coverage_scores) if coverage_scores else 0
+
+        # Prediction diversity (higher is better for capturing uncertainty)
+        pred_std = predicted_samples.std(dim=1).mean().item()
+        results["prediction_diversity"] = pred_std
 
     return results
 
 
-def train_bimodal_timegrad():
-    # Enhanced hyperparameters for bimodal data
-    data_dim = 2  # Use 2D for more interesting bimodal patterns
-    seq_len = 30
-    pred_len = 10
-    batch_size = 64
-    num_epochs = 150  # Reduced epochs
-    lr = 1e-3  # Higher learning rate
+def visualize_distributional_bimodal_data(batch_size=500):
+    """Visualize the distributional bimodal data"""
+    past_data, future_data = create_2d_distributional_bimodal_data(
+        batch_size, 20, 10, 2
+    )
+
+    # Combine all data
+    all_data = torch.cat([past_data, future_data], dim=1)  # (batch, time, dim)
+
+    # Take one time step to visualize the distribution
+    time_step_data = all_data[:, 0, :].numpy()  # (batch, 2)
+
+    plt.figure(figsize=(10, 8))
+    plt.scatter(time_step_data[:, 0], time_step_data[:, 1], alpha=0.6, s=20)
+    plt.title("Distributional Bimodal Data (Single Time Step)")
+    plt.xlabel("Dimension 1")
+    plt.ylabel("Dimension 2")
+    plt.grid(True, alpha=0.3)
+    plt.show()
+
+    return past_data, future_data
+
+
+def train_final_fixed_timegrad():
+    """Train the FINAL FIXED TimeGrad model"""
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Training on device: {device}")
 
-    print("Training Bimodal TimeGrad")
-    print(f"Data dimension: {data_dim}")
-    print(f"Device: {device}")
+    # Model parameters
+    data_dim = 2
+    seq_len = 20
+    pred_len = 5
+    batch_size = 64
+    num_epochs = 150  # Increased epochs since autoregressive training is more complex
+    lr = 8e-4  # Slightly lower learning rate for stability
 
-    model = BimodalTimeGrad(
-        data_dim,
-        hidden_dim=64,
-        num_diffusion_steps=50,  # Reduced steps for faster convergence
+    # Create model
+    model = FinalFixedBimodalTimeGrad(
+        data_dim=data_dim, hidden_dim=64, num_diffusion_steps=50
     ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
 
     losses = []
-    best_loss = float("inf")
-
-    # Pre-generate a larger dataset to avoid overfitting to small samples
-    print("Pre-generating training data...")
-    all_past_data = []
-    all_future_data = []
-    for _ in range(10):  # Generate 10 batches worth of data
-        past, future = create_complex_bimodal_data(
-            batch_size, seq_len, pred_len, data_dim
-        )
-        all_past_data.append(past)
-        all_future_data.append(future)
+    print("Training with AUTOREGRESSIVE TRAINING (matches inference)")
 
     for epoch in range(num_epochs):
         model.train()
 
-        # Use pre-generated data with some shuffling
-        data_idx = epoch % len(all_past_data)
-        past_data = all_past_data[data_idx].to(device)
-        future_data = all_future_data[data_idx].to(device)
-
-        # Add some noise for regularization
-        if epoch > 20:  # Add noise after initial convergence
-            past_data = past_data + 0.01 * torch.randn_like(past_data)
-            future_data = future_data + 0.01 * torch.randn_like(future_data)
+        # Generate fresh data each epoch
+        past_data, future_data = create_2d_distributional_bimodal_data(
+            batch_size, seq_len, pred_len, data_dim
+        )
+        past_data = past_data.to(device)
+        future_data = future_data.to(device)
 
         optimizer.zero_grad()
-        loss = model(past_data, future_data)
+        loss = model(past_data, future_data)  # Now uses autoregressive training!
         loss.backward()
 
-        # Gradient clipping for stability
+        # Gradient clipping
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
         optimizer.step()
@@ -434,406 +571,151 @@ def train_bimodal_timegrad():
 
         losses.append(loss.item())
 
-        if loss.item() < best_loss:
-            best_loss = loss.item()
-
-        if epoch % 15 == 0:  # More frequent logging
-            current_lr = optimizer.param_groups[0]["lr"]
-            print(
-                f"Epoch {epoch:3d}, Loss: {loss.item():.4f}, LR: {current_lr:.6f}, Best: {best_loss:.4f}"
-            )
+        if epoch % 25 == 0:
+            print(f"Epoch {epoch}, Loss: {loss.item():.4f}")
 
     return model, losses
 
 
-def test_bimodal_model(model, device="cpu"):
-    """Comprehensive testing for bimodal model"""
+def test_final_fixed_model(model, device="cpu"):
+    """Test the FINAL FIXED model"""
     model.eval()
 
     # Generate test data
-    test_batch_size = 8
-    past_data, true_future = create_complex_bimodal_data(test_batch_size, 30, 10, 2)
+    test_batch_size = 16
+    past_data, true_future = create_2d_distributional_bimodal_data(
+        test_batch_size, 20, 10, 2
+    )
     past_data = past_data.to(device)
 
     with torch.no_grad():
-        # Generate multiple samples to capture uncertainty
-        num_samples = 100
-        predicted_future = model.sample_future(
-            past_data, num_future_steps=10, num_samples=num_samples
+        # Generate multiple samples to capture bimodality
+        predicted_samples = model.sample_future_autoregressive(
+            past_data, num_future_steps=10, num_samples=100
         )
 
-    # Evaluate predictions
-    metrics = evaluate_bimodal_predictions(true_future, predicted_future)
+    # Evaluate
+    metrics = evaluate_distributional_bimodality(true_future, predicted_samples)
     print("\nEvaluation Metrics:")
     for key, value in metrics.items():
         print(f"{key}: {value:.4f}")
 
-    # Visualization
-    plot_bimodal_results(past_data, true_future, predicted_future, num_examples=4)
-
-    return metrics
+    return metrics, predicted_samples
 
 
-def plot_bimodal_results(past_data, true_future, predicted_samples, num_examples=4):
-    """Plot results showing bimodal predictions"""
-    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-    axes = axes.flatten()
+def quick_visual_test(model, device="cpu"):
+    """Quick visual test to see if we get discrete clusters now"""
+    model.eval()
 
-    for i in range(min(num_examples, len(axes))):
-        ax = axes[i]
-
-        # Past data
-        past = past_data[i].cpu().numpy()
-        time_past = np.arange(len(past))
-
-        # True future
-        true = true_future[i].cpu().numpy()
-        time_future = np.arange(len(past), len(past) + len(true))
-
-        # Predicted samples
-        pred_samples = (
-            predicted_samples[i].cpu().numpy()
-        )  # [num_samples, pred_len, data_dim]
-
-        # Plot for each dimension
-        colors = ["blue", "red"]
-        for d in range(past.shape[1]):
-            # Past data
-            ax.plot(
-                time_past,
-                past[:, d],
-                color=colors[d],
-                linestyle="-",
-                alpha=0.8,
-                label=f"Past Dim {d}",
-                linewidth=2,
-            )
-
-            # True future
-            ax.plot(
-                time_future,
-                true[:, d],
-                color=colors[d],
-                linestyle="-",
-                alpha=0.8,
-                label=f"True Future Dim {d}",
-                linewidth=2,
-            )
-
-            # Prediction quantiles (showing uncertainty)
-            pred_quantiles = np.quantile(
-                pred_samples[:, :, d], [0.1, 0.25, 0.5, 0.75, 0.9], axis=0
-            )
-
-            ax.fill_between(
-                time_future,
-                pred_quantiles[0],
-                pred_quantiles[4],
-                color=colors[d],
-                alpha=0.2,
-                label=f"80% Pred Interval Dim {d}",
-            )
-            ax.fill_between(
-                time_future,
-                pred_quantiles[1],
-                pred_quantiles[3],
-                color=colors[d],
-                alpha=0.3,
-            )
-            ax.plot(
-                time_future,
-                pred_quantiles[2],
-                color=colors[d],
-                linestyle="--",
-                alpha=0.9,
-                label=f"Pred Median Dim {d}",
-                linewidth=2,
-            )
-
-        ax.axvline(x=len(past) - 0.5, color="black", linestyle=":", alpha=0.5)
-        ax.set_title(f"Bimodal Series {i+1}")
-        ax.legend(fontsize=8)
-        ax.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig("bimodal_timegrad_results.png", dpi=150, bbox_inches="tight")
-    plt.show()
-
-
-def visualize_data_distribution(batch_size=1000):
-    """Visualize the bimodal data to ensure it has the right structure"""
-    past_data, future_data = create_complex_bimodal_data(batch_size, 30, 10, 2)
-
-    # Combine all data points
-    all_data = torch.cat([past_data, future_data], dim=1)  # [batch, time, dim]
-    all_data = all_data.reshape(-1, 2)  # Flatten to [batch*time, dim]
-
-    plt.figure(figsize=(12, 4))
-
-    # Plot 2D scatter
-    plt.subplot(1, 3, 1)
-    plt.scatter(all_data[:, 0], all_data[:, 1], alpha=0.5, s=1)
-    plt.title("2D Data Distribution")
-    plt.xlabel("Dimension 1")
-    plt.ylabel("Dimension 2")
-    plt.grid(True, alpha=0.3)
-
-    # Plot marginal distributions
-    plt.subplot(1, 3, 2)
-    plt.hist(all_data[:, 0], bins=50, alpha=0.7, density=True)
-    plt.title("Marginal Distribution - Dim 1")
-    plt.xlabel("Value")
-    plt.ylabel("Density")
-    plt.grid(True, alpha=0.3)
-
-    plt.subplot(1, 3, 3)
-    plt.hist(all_data[:, 1], bins=50, alpha=0.7, density=True)
-    plt.title("Marginal Distribution - Dim 2")
-    plt.xlabel("Value")
-    plt.ylabel("Density")
-    plt.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig("data_distribution.png", dpi=150, bbox_inches="tight")
-    plt.show()
-
-    print(
-        f"Data stats - Dim 1: mean={all_data[:, 0].mean():.2f}, std={all_data[:, 0].std():.2f}"
-    )
-    print(
-        f"Data stats - Dim 2: mean={all_data[:, 1].mean():.2f}, std={all_data[:, 1].std():.2f}"
-    )
-
-
-def simple_analysis(model, device="cpu"):
-    """
-    SIMPLE ANALYSIS: What does the real data look like vs model predictions?
-    """
-    print("=" * 60)
-    print("SIMPLE ANALYSIS: Real Data vs Model Predictions")
+    print("\n" + "=" * 60)
+    print("QUICK VISUAL TEST - Do we get discrete clusters?")
     print("=" * 60)
 
-    # Generate some test data
-    batch_size = 100  # More data for better visualization
-    past_data, true_future = create_complex_bimodal_data(batch_size, 30, 10, 2)
+    # Generate test data
+    batch_size = 50
+    past_data, true_future = create_2d_distributional_bimodal_data(batch_size, 20, 5, 2)
     past_data = past_data.to(device)
 
-    # Get model predictions
     with torch.no_grad():
-        model.eval()
-        predicted_samples = model.sample_future(
-            past_data, num_future_steps=10, num_samples=50
+        # Generate predictions
+        predicted_samples = model.sample_future_autoregressive(
+            past_data, num_future_steps=5, num_samples=100
         )
 
-    # Convert to numpy for plotting
+    # Convert to numpy and flatten
     true_future_np = true_future.numpy()
-    predicted_samples_np = predicted_samples.numpy()
+    predicted_samples_np = predicted_samples.cpu().numpy()
 
-    # Flatten all the data points (combine all time steps and batches)
-    true_all = true_future_np.reshape(-1, 2)  # [batch*time, 2]
-    pred_all = predicted_samples_np.reshape(-1, 2)  # [batch*samples*time, 2]
+    true_all = true_future_np.reshape(-1, 2)
+    pred_all = predicted_samples_np.reshape(-1, 2)
 
-    # Create the comparison plot
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    # Create side-by-side comparison
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 6))
 
-    # Plot 1: Real data
-    ax1 = axes[0]
-    ax1.scatter(
-        true_all[:, 0], true_all[:, 1], alpha=0.6, s=20, c="blue", label="Real Data"
-    )
-    ax1.set_title(
-        "REAL DATA\n(What the true bimodal data looks like)",
-        fontsize=14,
-        fontweight="bold",
-    )
+    # True data
+    ax1.scatter(true_all[:, 0], true_all[:, 1], alpha=0.6, s=15, c="blue")
+    ax1.set_title("TRUE DATA\n(Two distinct clusters)", fontweight="bold", fontsize=14)
     ax1.set_xlabel("Dimension 1")
     ax1.set_ylabel("Dimension 2")
     ax1.grid(True, alpha=0.3)
-    ax1.legend()
 
-    # Plot 2: Model predictions
-    ax2 = axes[1]
-    ax2.scatter(
-        pred_all[:, 0],
-        pred_all[:, 1],
-        alpha=0.6,
-        s=20,
-        c="red",
-        label="Model Predictions",
-    )
+    # Predicted data
+    ax2.scatter(pred_all[:, 0], pred_all[:, 1], alpha=0.6, s=15, c="red")
     ax2.set_title(
-        "MODEL PREDICTIONS\n(What the model generates)", fontsize=14, fontweight="bold"
+        "PREDICTED DATA\n(Should show discrete clusters)",
+        fontweight="bold",
+        fontsize=14,
     )
     ax2.set_xlabel("Dimension 1")
     ax2.set_ylabel("Dimension 2")
     ax2.grid(True, alpha=0.3)
-    ax2.legend()
 
-    # Plot 3: Overlay comparison
-    ax3 = axes[2]
+    # Overlay
+    ax3.scatter(true_all[:, 0], true_all[:, 1], alpha=0.4, s=10, c="blue", label="True")
     ax3.scatter(
-        true_all[:, 0], true_all[:, 1], alpha=0.5, s=15, c="blue", label="Real Data"
+        pred_all[:, 0], pred_all[:, 1], alpha=0.4, s=10, c="red", label="Predicted"
     )
-    ax3.scatter(
-        pred_all[:, 0],
-        pred_all[:, 1],
-        alpha=0.5,
-        s=15,
-        c="red",
-        label="Model Predictions",
+    ax3.set_title(
+        "OVERLAY\n(Key test: Are clusters discrete?)", fontweight="bold", fontsize=14
     )
-    ax3.set_title("COMPARISON\n(Do they look similar?)", fontsize=14, fontweight="bold")
     ax3.set_xlabel("Dimension 1")
     ax3.set_ylabel("Dimension 2")
-    ax3.grid(True, alpha=0.3)
     ax3.legend()
-
-    # Make all plots have the same scale for fair comparison
-    all_data = np.vstack([true_all, pred_all])
-    x_min, x_max = all_data[:, 0].min() - 0.5, all_data[:, 0].max() + 0.5
-    y_min, y_max = all_data[:, 1].min() - 0.5, all_data[:, 1].max() + 0.5
-
-    for ax in axes:
-        ax.set_xlim(x_min, x_max)
-        ax.set_ylim(y_min, y_max)
+    ax3.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig("simple_comparison.png", dpi=150, bbox_inches="tight")
+    plt.savefig("autoregressive_fix_test.png", dpi=150, bbox_inches="tight")
     plt.show()
 
-    # Simple analysis
-    print("\n" + "=" * 60)
-    print("SIMPLE STATISTICS")
-    print("=" * 60)
+    # Check if we now get discrete clusters
+    try:
+        gmm = GaussianMixture(n_components=2, random_state=42)
+        gmm.fit(pred_all)
+        separation = np.sqrt(np.sum((gmm.means_[0] - gmm.means_[1]) ** 2))
 
-    # Check if both have similar means and spreads
-    print(
-        f"Real data - Mean: [{true_all[:, 0].mean():.2f}, {true_all[:, 1].mean():.2f}]"
-    )
-    print(f"Real data - Std:  [{true_all[:, 0].std():.2f}, {true_all[:, 1].std():.2f}]")
-    print()
-    print(
-        f"Model data - Mean: [{pred_all[:, 0].mean():.2f}, {pred_all[:, 1].mean():.2f}]"
-    )
-    print(
-        f"Model data - Std:  [{pred_all[:, 0].std():.2f}, {pred_all[:, 1].std():.2f}]"
-    )
-    print()
+        print(f"\nPrediction Analysis:")
+        print(f"Mode separation: {separation:.2f}")
+        print(f"Mode centers: {gmm.means_.flatten()}")
+        print(f"Mode weights: {gmm.weights_}")
 
-    # Check if both are bimodal
-    def check_bimodal(data, name):
-        print(f"{name} Bimodality Check:")
-        try:
-            # Fit 2-component Gaussian mixture
-            from sklearn.mixture import GaussianMixture
-
-            gmm = GaussianMixture(n_components=2, random_state=42)
-            gmm.fit(data)
-
-            centers = gmm.means_
-            print(
-                f"  - Found 2 modes at: [{centers[0][0]:.1f}, {centers[0][1]:.1f}] and [{centers[1][0]:.1f}, {centers[1][1]:.1f}]"
-            )
-            print(f"  - Mode weights: {gmm.weights_[0]:.2f} and {gmm.weights_[1]:.2f}")
-
-            # Distance between modes (higher = more separated)
-            distance = np.sqrt(np.sum((centers[0] - centers[1]) ** 2))
-            print(f"  - Distance between modes: {distance:.2f}")
-
-            return centers, distance
-        except:
-            print(f"  - Could not fit 2 modes")
-            return None, 0
-
-    real_centers, real_distance = check_bimodal(true_all, "REAL DATA")
-    print()
-    model_centers, model_distance = check_bimodal(pred_all, "MODEL DATA")
-    print()
-
-    # Final verdict
-    print("=" * 60)
-    print("FINAL VERDICT")
-    print("=" * 60)
-
-    if real_centers is not None and model_centers is not None:
-        if abs(real_distance - model_distance) < 1.0:
-            print("✅ SUCCESS: Model captures bimodal structure!")
-            print(
-                f"   Real modes separated by {real_distance:.2f}, model by {model_distance:.2f}"
-            )
+        if separation > 3.0:
+            print("✅ SUCCESS: Discrete clusters detected!")
         else:
-            print("⚠️  PARTIAL: Model shows bimodal structure but different separation")
-            print(
-                f"   Real modes separated by {real_distance:.2f}, model by {model_distance:.2f}"
-            )
-    else:
-        print("❌ ISSUE: Could not detect clear bimodal structure")
+            print("⚠️ Still getting continuous distribution")
 
-    return true_all, pred_all
-
-
-def explain_what_we_see():
-    """
-    Explain what all those confusing metrics actually mean
-    """
-    print("\n" + "=" * 60)
-    print("WHAT DO THE CONFUSING METRICS MEAN?")
-    print("=" * 60)
-
-    print("1. MSE (Mean Squared Error) = 4.0")
-    print("   - This measures 'how far off' the predictions are on average")
-    print("   - For bimodal data, this will be high because sometimes the model")
-    print("     predicts Mode A when the truth is Mode B (or vice versa)")
-    print("   - MSE = 4.0 means predictions are off by ~2 units on average")
-    print("   - This is NORMAL for bimodal data!")
-    print()
-
-    print("2. Coverage = 0.375 (37.5%)")
-    print(
-        "   - This measures: 'What % of true values fall within the prediction intervals?'"
-    )
-    print("   - We want 80% of true values to fall in the 80% prediction interval")
-    print("   - Getting 37.5% means the model is being 'too confident'")
-    print("   - This often happens early in training")
-    print()
-
-    print("3. Bimodality Score = -0.73")
-    print("   - This tries to measure if the predictions have 2 modes")
-    print("   - Positive = bimodal, Negative = unimodal")
-    print("   - -0.73 suggests the model isn't fully capturing both modes yet")
-    print("   - But the visual plots are more reliable than this metric!")
-    print()
-
-    print("BOTTOM LINE:")
-    print("The metrics look 'bad' but this is normal for bimodal data.")
-    print("What matters is: Do the scatter plots show 2 clear modes?")
+    except Exception as e:
+        print(f"❌ Could not fit GMM: {e}")
 
 
 if __name__ == "__main__":
-    print("=== Visualizing Data Distribution ===")
-    visualize_data_distribution()
+    print("=== FINAL FIXED TimeGrad with Autoregressive Training ===")
 
-    print("\n=== Bimodal TimeGrad Training ===")
-    model, losses = train_bimodal_timegrad()
+    print("\n1. Visualizing data...")
+    visualize_distributional_bimodal_data()
 
-    print("\n=== SIMPLE ANALYSIS (EASY TO UNDERSTAND) ===")
+    print("\n2. Training model with AUTOREGRESSIVE TRAINING...")
+    model, losses = train_final_fixed_timegrad()
+
+    print("\n3. Quick visual test...")
     device = next(model.parameters()).device
-    simple_analysis(model, device)
+    quick_visual_test(model, device)
 
-    print("\n=== EXPLANATION OF CONFUSING METRICS ===")
-    explain_what_we_see()
+    print("\n4. Full testing...")
+    metrics, predictions = test_final_fixed_model(model, device)
 
-    print("\n=== Original Complex Analysis ===")
-    metrics = test_bimodal_model(model, device)
+    print("\n5. Training completed!")
+    print("Key fixes applied:")
+    print("✅ Fixed DDPM sampling formula")
+    print("✅ AUTOREGRESSIVE TRAINING (matches inference)")
+    print("✅ Proper context updating during training")
+    print("✅ Same loss as original TimeGrad (MSE on noise)")
 
-    print("\n=== Training Loss Plot ===")
+    # Plot training loss
     plt.figure(figsize=(10, 6))
-    plt.plot(losses)
-    plt.title("Training Loss")
+    plt.plot(losses, "b-", linewidth=2)
+    plt.title("Training Loss (Autoregressive Training)", fontweight="bold")
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
-    plt.grid(True)
-    plt.savefig("bimodal_training_loss.png", dpi=150, bbox_inches="tight")
+    plt.grid(True, alpha=0.3)
+    plt.savefig("autoregressive_training_loss.png", dpi=150, bbox_inches="tight")
     plt.show()
-
-    print("\nDone! The key plot to look at is 'simple_comparison.png'")

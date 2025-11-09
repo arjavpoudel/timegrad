@@ -1,12 +1,3 @@
-"""
-FINAL FIXED TimeGrad-style diffusion model for bimodal time series forecasting.
-Key fixes:
-1. Correct DDPM sampling formula ✅
-2. PROPER autoregressive training (matches inference) ✅
-3. Distributional bimodality ✅
-4. Better architecture based on original TimeGrad ✅
-"""
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -34,7 +25,7 @@ def cosine_beta_schedule(timesteps, s=0.008):
 
 
 class GaussianDiffusion(nn.Module):
-    """Fixed diffusion model with correct DDPM sampling"""
+    """diffusion model with DDPM sampling"""
 
     def __init__(self, denoise_fn, data_dim, num_steps=50, beta_schedule="cosine"):
         super().__init__()
@@ -53,7 +44,6 @@ class GaussianDiffusion(nn.Module):
         alphas_cumprod = np.cumprod(alphas)
         alphas_cumprod_prev = np.append(1.0, alphas_cumprod[:-1])
 
-        # Convert to torch tensors
         to_torch = partial(torch.tensor, dtype=torch.float32)
 
         self.register_buffer("betas", to_torch(betas))
@@ -61,13 +51,13 @@ class GaussianDiffusion(nn.Module):
         self.register_buffer("alphas_cumprod", to_torch(alphas_cumprod))
         self.register_buffer("alphas_cumprod_prev", to_torch(alphas_cumprod_prev))
 
-        # Forward process coefficients
+        # forward process coefficients
         self.register_buffer("sqrt_alphas_cumprod", to_torch(np.sqrt(alphas_cumprod)))
         self.register_buffer(
             "sqrt_one_minus_alphas_cumprod", to_torch(np.sqrt(1.0 - alphas_cumprod))
         )
 
-        # Reverse process coefficients
+        # reverse process coefficients
         self.register_buffer(
             "sqrt_recip_alphas_cumprod", to_torch(np.sqrt(1.0 / alphas_cumprod))
         )
@@ -75,7 +65,7 @@ class GaussianDiffusion(nn.Module):
             "sqrt_recipm1_alphas_cumprod", to_torch(np.sqrt(1.0 / alphas_cumprod - 1))
         )
 
-        # Posterior q(x_{t-1} | x_t, x_0) coefficients
+        # posterior q(x_{t-1} | x_t, x_0) coefficients
         posterior_variance = (
             betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
         )
@@ -130,13 +120,13 @@ class GaussianDiffusion(nn.Module):
 
     def p_mean_variance(self, x_t, cond, t):
         """Compute mean and variance for p(x_{t-1} | x_t)"""
-        # Predict noise
+        # predict noise
         predicted_noise = self.denoise_fn(x_t, t, cond)
 
-        # Predict x_0
+        # predict x_0
         x_start = self.predict_start_from_noise(x_t, t, predicted_noise)
 
-        # Get posterior mean and variance
+        # get posterior mean and variance
         model_mean, posterior_variance, posterior_log_variance = (
             self.q_posterior_mean_variance(x_start, x_t, t)
         )
@@ -145,9 +135,8 @@ class GaussianDiffusion(nn.Module):
 
     @torch.no_grad()
     def p_sample(self, x_t, cond, t):
-        """Single reverse diffusion step - CORRECT IMPLEMENTATION"""
+        """Single reverse diffusion step"""
         batch_size = x_t.shape[0]
-        device = x_t.device
 
         # Get mean and variance
         model_mean, _, model_log_variance = self.p_mean_variance(x_t, cond, t)
@@ -162,27 +151,27 @@ class GaussianDiffusion(nn.Module):
 
     @torch.no_grad()
     def sample(self, cond, num_samples=1):
-        """Sample from the diffusion model"""
+        """Sample from diff model"""
         batch_size = cond.shape[0]
         device = cond.device
 
         if num_samples > 1:
-            # Repeat conditioning for multiple samples
+            # repeat conditioning for multiple samples
             cond = cond.repeat_interleave(num_samples, dim=0)
             total_batch_size = batch_size * num_samples
         else:
             total_batch_size = batch_size
 
-        # Start from pure noise
+        # start from pure noise
         x = torch.randn(total_batch_size, self.data_dim, device=device)
 
-        # Reverse diffusion process
+        # reverse diffusion process
         for i in reversed(range(self.num_timesteps)):
             t = torch.full((total_batch_size,), i, device=device, dtype=torch.long)
             x = self.p_sample(x, cond, t)
 
         if num_samples > 1:
-            # Reshape to (batch_size, num_samples, data_dim)
+            # reshape to (batch_size, num_samples, data_dim)
             x = x.view(batch_size, num_samples, self.data_dim)
 
         return x
@@ -192,22 +181,22 @@ class GaussianDiffusion(nn.Module):
         batch_size = x_start.shape[0]
         device = x_start.device
 
-        # Random timesteps
+        # random timesteps
         t = torch.randint(0, self.num_timesteps, (batch_size,), device=device)
 
-        # Add noise
+        # add noise
         noise = torch.randn_like(x_start)
         x_noisy = self.q_sample(x_start, t, noise)
 
-        # Predict noise
+        # predict noise
         predicted_noise = self.denoise_fn(x_noisy, t, cond)
 
-        # MSE loss on noise prediction (same as original TimeGrad)
+        # mse loss on noise pred
         return F.mse_loss(predicted_noise, noise)
 
 
 class SimpleDenoiser(nn.Module):
-    """Simplified but proper denoiser network"""
+    """Simplified denoiser network"""
 
     def __init__(self, data_dim, context_dim, hidden_dim=128, num_layers=3):
         super().__init__()
@@ -221,7 +210,7 @@ class SimpleDenoiser(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
 
-        # Sinusoidal time embedding
+        # sinusoidal time embedding
         self.time_embed = SinusoidalPositionEmbeddings(time_dim)
 
         # Input projections
@@ -290,7 +279,7 @@ class ResidualBlock(nn.Module):
 
 
 class FinalFixedBimodalTimeGrad(nn.Module):
-    """FINAL FIXED TimeGrad model with proper autoregressive training"""
+    """FINAL AR TimeGrad-style model"""
 
     def __init__(self, data_dim, hidden_dim=64, num_diffusion_steps=50):
         super().__init__()
@@ -318,25 +307,24 @@ class FinalFixedBimodalTimeGrad(nn.Module):
     def encode_past(self, past_data):
         """Encode past data into context vector"""
         # RNN encoding
-        rnn_out, (h_n, _) = self.rnn(past_data)
+        _, (h_n, _) = self.rnn(past_data)
 
-        # Use last hidden state as context
+        #  last hidden state as context
         context = self.context_proj(h_n[-1])
         return context
 
     def forward(self, past_data, future_data):
         """
-        FIXED TRAINING: Autoregressive training that matches inference
-        This is the KEY FIX - training now matches inference procedure
+        Autoregressive training that matches inference
         """
-        batch_size, pred_len, _ = future_data.shape
+        _, pred_len, _ = future_data.shape
         total_loss = 0.0
 
-        # Keep track of the evolving sequence during training
+        # keeping track of  evolving sequence during training
         current_sequence = past_data.clone()
 
         for t in range(pred_len):
-            # Encode current sequence (this changes each step - KEY FIX!)
+            # Encode current sequence
             context = self.encode_past(current_sequence)
 
             # Target for this time step
@@ -350,8 +338,10 @@ class FinalFixedBimodalTimeGrad(nn.Module):
             # This simulates what happens during inference but uses ground truth
             current_sequence = torch.cat(
                 [
-                    current_sequence[:, 1:, :],  # Remove oldest
-                    target.unsqueeze(1),  # Add current ground truth
+                    current_sequence[
+                        :, 1:, :
+                    ],  # remove oldest - always preserving context window of 25!
+                    target.unsqueeze(1),  # add current ground truth
                 ],
                 dim=1,
             )
@@ -362,14 +352,11 @@ class FinalFixedBimodalTimeGrad(nn.Module):
         """Generate future samples with proper autoregressive generation"""
         self.eval()
         with torch.no_grad():
-            batch_size = past_data.shape[0]
-            device = past_data.device
-
             # Initialize sequence with past data
             current_sequence = past_data.clone()
             future_samples = []
 
-            for step in range(num_future_steps):
+            for _ in range(num_future_steps):
                 # Encode current sequence
                 context = self.encode_past(current_sequence)
 
@@ -390,10 +377,10 @@ class FinalFixedBimodalTimeGrad(nn.Module):
                         dim=1,
                     )
                 else:
-                    # Multiple samples case - use mean for sequence update
+                    # multiple samples case - use mean for sequence update
                     next_step_mean = next_samples.mean(dim=1)  # (batch_size, data_dim)
                     future_samples.append(
-                        next_samples.unsqueeze(2)
+                        next_samples.unsqueeze(1)
                     )  # Add time dimension
 
                     # Update sequence with mean
@@ -407,27 +394,25 @@ class FinalFixedBimodalTimeGrad(nn.Module):
                 )  # (batch_size, pred_len, data_dim)
             else:
                 return torch.cat(
-                    future_samples, dim=2
+                    future_samples, dim=1
                 )  # (batch_size, num_samples, pred_len, data_dim)
 
 
 def create_2d_distributional_bimodal_data(
     batch_size=32, seq_len=20, pred_len=5, data_dim=2
 ):
-    """
-    Create 2D time series with clear bimodal structure in 2D space.
-    """
+    """Bimodal data with no correlation between dimensions"""
     data = torch.zeros(batch_size, seq_len + pred_len, data_dim)
 
-    # Two well-separated modes in 2D space
-    mode1_center = torch.tensor([-2.5, -2.0])
-    mode2_center = torch.tensor([2.5, 2.0])
+    # UNCORRELATED modes - one axis switches, other stays centered
+    mode1_center = torch.tensor([-2.5, 0.0])  # Left-center
+    mode2_center = torch.tensor([2.5, 0.0])  # Right-center
     mode_std = 0.4
 
     for t in range(seq_len + pred_len):
         for b in range(batch_size):
             if torch.rand(1) < 0.5:
-                data[b, t] = mode1_center + mode_std * torch.randn(data_dim)
+                data[b, t] =   *  #data[b,t-1] + mode_std * torch.randn(data_dim)
             else:
                 data[b, t] = mode2_center + mode_std * torch.randn(data_dim)
 
@@ -437,9 +422,8 @@ def create_2d_distributional_bimodal_data(
 def evaluate_distributional_bimodality(true_data, predicted_samples):
     """Evaluate how well the model captures distributional bimodality."""
     results = {}
-
-    # Basic MSE
-    if predicted_samples.dim() == 4:  # Multiple samples case
+    # mse between mean prediction and true data
+    if predicted_samples.dim() == 4:  # multiple samples case
         mean_pred = predicted_samples.mean(dim=1)
     else:
         mean_pred = predicted_samples
@@ -447,9 +431,9 @@ def evaluate_distributional_bimodality(true_data, predicted_samples):
     mse = F.mse_loss(mean_pred, true_data).item()
     results["mse"] = mse
 
-    # For multiple samples, check bimodality at each time step
+    # for multiple samples, check bimodality at each time step
     if predicted_samples.dim() == 4:
-        batch_size, num_samples, pred_len, data_dim = predicted_samples.shape
+        batch_size, _, pred_len, data_dim = predicted_samples.shape
 
         bimodality_scores = []
         coverage_scores = []
@@ -477,12 +461,12 @@ def evaluate_distributional_bimodality(true_data, predicted_samples):
                             separation = abs(centers[0] - centers[1])
                             weights = gmm.weights_
 
-                            # Good bimodality: well separated modes with reasonable weights
+                            # good bimodality: well separated modes with reasonable weights
                             min_weight = min(weights)
                             bimodality_score = separation * min_weight
                             bimodality_scores.append(bimodality_score)
 
-                            # Coverage: does the true value fall within the prediction distribution?
+                            # coverage: does the true value fall within the prediction distribution?
                             true_val = true_t_d[b].item()
                             pred_min, pred_max = samples.min(), samples.max()
                             coverage = 1.0 if pred_min <= true_val <= pred_max else 0.0
@@ -495,7 +479,7 @@ def evaluate_distributional_bimodality(true_data, predicted_samples):
         )
         results["coverage"] = np.mean(coverage_scores) if coverage_scores else 0
 
-        # Prediction diversity (higher is better for capturing uncertainty)
+        # prediction diversity (higher = better for capturing uncertainty)
         pred_std = predicted_samples.std(dim=1).mean().item()
         results["prediction_diversity"] = pred_std
 
@@ -508,10 +492,10 @@ def visualize_distributional_bimodal_data(batch_size=500):
         batch_size, 20, 10, 2
     )
 
-    # Combine all data
+    # combine all data
     all_data = torch.cat([past_data, future_data], dim=1)  # (batch, time, dim)
 
-    # Take one time step to visualize the distribution
+    # take one time step to visualize the distribution
     time_step_data = all_data[:, 0, :].numpy()  # (batch, 2)
 
     plt.figure(figsize=(10, 8))
@@ -630,7 +614,7 @@ def quick_visual_test(model, device="cpu"):
     pred_all = predicted_samples_np.reshape(-1, 2)
 
     # Create side-by-side comparison
-    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 6))
+    _, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 6))
 
     # True data
     ax1.scatter(true_all[:, 0], true_all[:, 1], alpha=0.6, s=15, c="blue")
